@@ -78,6 +78,7 @@ Global Const $MM_MIM_DATA = 0x03C3
 Global $g_aMidiInNames[64]
 Global $g_aMidiInDevIds[64]
 Global $g_iMidiInDevCount = 0
+Global $g_aBoundCC[8] = [1, 2, 3, 4, 5, 6, 7, 8]
 
 ; -----------------------------------------------------------------------
 ; ---- Theme Color Palettes (Dark Studio / Light Studio) ----------------
@@ -314,11 +315,11 @@ Func BuildMainGUI()
         $g_idVal[$iSwitchIdx] = GUICtrlCreateInput($g_aSlots[$iSwitchIdx][2], $iX + 155, 110, 30, 20)
         _RegInput($g_idVal[$iSwitchIdx])
 
-        $g_idLiveLbl[$iSwitchIdx] = GUICtrlCreateLabel("Live: --", $iX + 10, 140, 75, 18)
+        $g_idLiveLbl[$iSwitchIdx] = GUICtrlCreateLabel("Live: --", $iX + 6, 140, 88, 18)
         GUICtrlSetFont(-1, 8, 600)
         _RegLabel($g_idLiveLbl[$iSwitchIdx])
 
-        $g_idBtnSet[$iSwitchIdx] = GUICtrlCreateButton("Set Switch", $iX + 90, 137, $iColW - 100, 22)
+        $g_idBtnSet[$iSwitchIdx] = GUICtrlCreateButton("Set Switch", $iX + 96, 137, $iColW - 104, 22)
         _RegBtn($g_idBtnSet[$iSwitchIdx])
         GUICtrlCreateGroup("", -99, -99, 1, 1)
 
@@ -360,11 +361,11 @@ Func BuildMainGUI()
         GUICtrlSetFont(-1, 7)
         _RegLabel($idScaleMin)
 
-        $g_idLiveLbl[$iFaderIdx] = GUICtrlCreateLabel("Live: 0", $iX + 10, 455, 75, 18)
+        $g_idLiveLbl[$iFaderIdx] = GUICtrlCreateLabel("Live: 0", $iX + 6, 455, 88, 18)
         GUICtrlSetFont(-1, 8, 600)
         _RegLabel($g_idLiveLbl[$iFaderIdx])
 
-        $g_idBtnSet[$iFaderIdx] = GUICtrlCreateButton("Set Fader", $iX + 90, 452, $iColW - 100, 22)
+        $g_idBtnSet[$iFaderIdx] = GUICtrlCreateButton("Set Fader", $iX + 96, 452, $iColW - 104, 22)
         _RegBtn($g_idBtnSet[$iFaderIdx])
         GUICtrlCreateGroup("", -99, -99, 1, 1)
     Next
@@ -760,35 +761,71 @@ Func WM_MIM_DATA_HANDLER($hWnd, $iMsg, $wParam, $lParam)
     Local $iTypeNibble = BitAND($iStatus, 0xF0)
     Local $iChannel    = BitAND($iStatus, 0x0F) + 1
 
-    Local $bMatched = False
+    Local $iTargetSlot = -1
+
+    ; --- NIVEAU 1 : Correspondance exacte avec le profil actif (Type, Canal, CC/Note) ---
     For $i = 0 To 7
         Local $iSlotType = $MSGTYPE_CODES[$g_aSlots[$i][0]]
         Local $iSlotChan = $g_aSlots[$i][1]
         Local $iSlotVal  = $g_aSlots[$i][2]
-
-        ; Match exact slot (Type, Channel, Value) or CC match for faders 0-3
-        If ($iTypeNibble = $iSlotType And $iChannel = $iSlotChan And $iData1 = $iSlotVal) _
-            Or ($iTypeNibble = 0xB0 And $i <= 3 And $iData1 = $iSlotVal) Then
-            $g_aLiveMidiVal[$i] = $iData2
-
-            If $i <= 3 Then
-                ; Faders 0-3: animate vertical slider (inverted: 127 - value)
-                GUICtrlSetData($g_idSlider[$i], 127 - $iData2)
-                GUICtrlSetData($g_idLiveLbl[$i], "Live: " & $iData2)
-            Else
-                GUICtrlSetData($g_idLiveLbl[$i], "Live: " & $iData2)
-            EndIf
-
-            Local $sName = ($g_aSlots[$i][3] <> "") ? $g_aSlots[$i][3] : $SLOT_NAMES[$i]
-            LogMsg("[MIDI IN] " & $sName & " (Pos " & $i & ") -> CC " & $iData1 & " = " & $iData2 & " (Ch " & $iChannel & ")")
-            $bMatched = True
+        If $iTypeNibble = $iSlotType And $iChannel = $iSlotChan And $iData1 = $iSlotVal Then
+            $iTargetSlot = $i
             ExitLoop
         EndIf
     Next
 
-    If Not $bMatched Then
-        LogMsg("[MIDI IN] Ch " & $iChannel & " | Status: " & Hex($iStatus, 2) & " | D1: " & $iData1 & " | D2: " & $iData2)
+    ; --- NIVEAU 2 : Correspondance par CC/Note dans le profil actif (canal ignore) ---
+    If $iTargetSlot = -1 Then
+        For $i = 0 To 7
+            Local $iSlotType = $MSGTYPE_CODES[$g_aSlots[$i][0]]
+            Local $iSlotVal  = $g_aSlots[$i][2]
+            If $iTypeNibble = $iSlotType And $iData1 = $iSlotVal Then
+                $iTargetSlot = $i
+                ExitLoop
+            EndIf
+        Next
     EndIf
+
+    ; --- NIVEAU 3 : Correspondance Materielle Usine (controleur redemarre ou RAM perdue) ---
+    ; Faders physiques 1 a 4 = CC 1 a 4. Switches 1 a 4 = CC 5 a 8.
+    If $iTargetSlot = -1 And $iTypeNibble = 0xB0 Then
+        If $iData1 >= 1 And $iData1 <= 4 Then
+            $iTargetSlot = $iData1 - 1 ; Faders 0, 1, 2, 3
+        ElseIf $iData1 >= 5 And $iData1 <= 8 Then
+            $iTargetSlot = $iData1 - 1 ; Switches 4, 5, 6, 7
+        EndIf
+    EndIf
+
+    ; --- NIVEAU 4 : Table de liaison dynamique en direct ---
+    If $iTargetSlot = -1 Then
+        For $i = 0 To 7
+            If $g_aBoundCC[$i] = $iData1 Then
+                $iTargetSlot = $i
+                ExitLoop
+            EndIf
+        Next
+    EndIf
+
+    ; Si la tranche est identifiee, on anime l'interface en direct !
+    If $iTargetSlot >= 0 Then
+        $g_aLiveMidiVal[$iTargetSlot] = $iData2
+        $g_aBoundCC[$iTargetSlot] = $iData1
+
+        If $iTargetSlot <= 3 Then
+            ; Faders 0-3: animer le slider vertical (inverse: 127 - valeur)
+            GUICtrlSetData($g_idSlider[$iTargetSlot], 127 - $iData2)
+            GUICtrlSetData($g_idLiveLbl[$iTargetSlot], "Live: " & $iData2 & " [CC " & $iData1 & "]")
+        Else
+            ; Switches 4-7: afficher valeur et CC
+            GUICtrlSetData($g_idLiveLbl[$iTargetSlot], "Live: " & $iData2 & " [CC " & $iData1 & "]")
+        EndIf
+
+        Local $sName = ($g_aSlots[$iTargetSlot][3] <> "") ? $g_aSlots[$iTargetSlot][3] : $SLOT_NAMES[$iTargetSlot]
+        LogMsg("[MIDI IN] " & $sName & " (Pos " & $iTargetSlot & ") -> CC " & $iData1 & " = " & $iData2 & " (Ch " & $iChannel & ")")
+        Return $GUI_RUNDEFMSG
+    EndIf
+
+    LogMsg("[MIDI IN] Ch " & $iChannel & " | Status: " & Hex($iStatus, 2) & " | D1: " & $iData1 & " | D2: " & $iData2)
     Return $GUI_RUNDEFMSG
 EndFunc
 
@@ -883,6 +920,10 @@ Func ApplySingleSlot($iSlot)
     If $iSlot <= 3 And $g_aSlots[$iSlot][3] <> "" Then $sLbl &= " [" & $g_aSlots[$iSlot][3] & "]"
 
     SendVendorCommand($iIdx, $iSpec, $iNormal, $iMulti, "Set " & $sLbl)
+    If $iSlot <= 7 Then
+        $g_aBoundCC[$iSlot] = $iVal
+        GUICtrlSetData($g_idLiveLbl[$iSlot], "Live: -- [CC " & $iVal & "]")
+    EndIf
 EndFunc
 
 Func ApplyAllSlots()
@@ -907,6 +948,10 @@ Func ApplyAllSlots()
         If $i <= 3 And $g_aSlots[$i][3] <> "" Then $sLbl &= " (" & $g_aSlots[$i][3] & ")"
 
         SendVendorCommand($iIdx, $iSpec, $iNormal, $iMulti, "Pos " & $i & ": " & $sLbl)
+        If $i <= 7 Then
+            $g_aBoundCC[$i] = $iVal
+            GUICtrlSetData($g_idLiveLbl[$i], "Live: -- [CC " & $iVal & "]")
+        EndIf
         Sleep(25) ; Safe transmission delay between packets
     Next
     LogMsg("=== ALL SLOTS SUCCESSFULLY SENT TO RAM ===")
@@ -1023,10 +1068,11 @@ Func LoadProfileFromFile($sFile, $bShowAlert = True)
             GUICtrlSetData($g_idType[$i], $MSGTYPE_NAMES[$g_aSlots[$i][0]])
             GUICtrlSetData($g_idChan[$i], $g_aSlots[$i][1])
             GUICtrlSetData($g_idVal[$i],  $g_aSlots[$i][2])
+            $g_aBoundCC[$i] = $g_aSlots[$i][2]
+            GUICtrlSetData($g_idLiveLbl[$i], "Live: -- [CC " & $g_aSlots[$i][2] & "]")
             If $i <= 3 Then
                 GUICtrlSetData($g_idScribble[$i], $g_aSlots[$i][3])
                 GUICtrlSetData($g_idSlider[$i], 127) ; default bottom position
-                GUICtrlSetData($g_idLiveLbl[$i], "Live: --")
             EndIf
         Else
             ; LED
@@ -1248,6 +1294,19 @@ Func MainLoop()
                 For $s = 0 To 7
                     If $msg = $g_idBtnSet[$s] Then
                         ApplySingleSlot($s)
+                        ExitLoop
+                    EndIf
+                Next
+
+            ; Click on Live label to sync detected hardware CC into target box
+            Case $g_idLiveLbl[0], $g_idLiveLbl[1], $g_idLiveLbl[2], $g_idLiveLbl[3], _
+                 $g_idLiveLbl[4], $g_idLiveLbl[5], $g_idLiveLbl[6], $g_idLiveLbl[7]
+                For $s = 0 To 7
+                    If $msg = $g_idLiveLbl[$s] Then
+                        If $g_aBoundCC[$s] > 0 Then
+                            GUICtrlSetData($g_idVal[$s], $g_aBoundCC[$s])
+                            LogMsg("Synced " & $SLOT_NAMES[$s] & " target CC to detected hardware CC " & $g_aBoundCC[$s])
+                        EndIf
                         ExitLoop
                     EndIf
                 Next
